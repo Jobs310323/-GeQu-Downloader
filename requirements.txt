@@ -1,0 +1,11 @@
+PyQt6
+PyQt6-WebEngine
+yt-dlp
+Pillow
+requests
+fastapi
+uvicorn[standard]
+websockets
+pydantic
+anthropic
+pyinstaller

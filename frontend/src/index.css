@@ -1,0 +1,93 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "Consolas", monospace;
+
+  --color-background: #08090c;
+  --color-surface: #101218;
+  --color-surface-elevated: #151821;
+  --color-border: rgba(255, 255, 255, 0.08);
+  --color-border-strong: rgba(255, 255, 255, 0.14);
+
+  --color-text: #e7e8ec;
+  --color-text-muted: #8b8f9c;
+  --color-text-faint: #5a5e6a;
+
+  --color-primary: #22d3ee;
+  --color-primary-dim: #0e7490;
+  --color-secondary: #a78bfa;
+
+  --color-success: #34d399;
+  --color-warning: #fbbf24;
+  --color-danger: #f87171;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+/* Тот же cascade layer, что генерирует Tailwind для @theme — иначе токены темы
+   (объявленные Tailwind внутри @layer theme) перебивают обычный неслоистый override
+   независимо от специфичности и порядка. */
+@layer theme {
+:root[data-theme="light"] {
+  --color-background: #f3f4f7;
+  --color-surface: #ffffff;
+  --color-surface-elevated: #ffffff;
+  --color-border: rgba(15, 17, 22, 0.08);
+  --color-border-strong: rgba(15, 17, 22, 0.14);
+
+  --color-text: #14161a;
+  --color-text-muted: #565a66;
+  --color-text-faint: #9498a3;
+
+  --color-primary: #0891b2;
+  --color-primary-dim: #0e7490;
+  --color-secondary: #7c3aed;
+}
+}
+
+body {
+  margin: 0;
+  background: var(--color-background);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-border-strong);
+  border-radius: 8px;
+}
+
+.glass {
+  background: color-mix(in srgb, var(--color-surface) 70%, transparent);
+  backdrop-filter: blur(16px);
+  border: 1px solid var(--color-border);
+}
+
+.glass-elevated {
+  background: color-mix(in srgb, var(--color-surface-elevated) 75%, transparent);
+  backdrop-filter: blur(20px);
+  border: 1px solid var(--color-border-strong);
+}
+
+.subtle-glow {
+  box-shadow: 0 0 0 1px var(--color-border), 0 8px 24px -12px rgba(34, 211, 238, 0.25);
+}

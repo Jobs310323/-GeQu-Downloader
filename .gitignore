@@ -1,0 +1,31 @@
+# Сборка
+build/
+dist/
+*.spec.bak
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Виртуальные окружения
+venv/
+.venv/
+env/
+
+# Фронтенд
+frontend/node_modules/
+frontend/dist/
+
+# Локальные настройки и история загрузок: там же лежит ключ Anthropic API
+# (summary_api_key) — этот файл не должен попадать в репозиторий никогда.
+config/settings.json
+logs/
+*.log
+
+# Бандл ffmpeg — опциональный и весит сотни мегабайт
+assets/bin/
+
+# Служебное
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
