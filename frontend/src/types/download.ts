@@ -7,6 +7,7 @@ export type DownloadStatus =
   | "merging"
   | "converting"
   | "paused"
+  | "reconnecting"
   | "completed"
   | "failed"
   | "cancelled";

@@ -9,7 +9,7 @@ const ERROR_COPY: Record<ErrorCode, { title: string; body: string }> = {
   },
   NETWORK_ERROR: {
     title: "Connection problem",
-    body: "Couldn't reach YouTube. Check your internet connection and try again.",
+    body: "Couldn't reach the video. NeoLoader will keep retrying automatically once your connection is back.",
   },
   VIDEO_UNAVAILABLE: {
     title: "Video unavailable",
@@ -29,7 +29,7 @@ const ERROR_COPY: Record<ErrorCode, { title: string; body: string }> = {
   },
   INVALID_URL: {
     title: "That link doesn't look right",
-    body: "Paste a valid YouTube video or playlist URL.",
+    body: "Paste a valid YouTube or Rutube video/playlist URL.",
   },
   NO_TRANSCRIPT: {
     title: "No subtitles for this video",
