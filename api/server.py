@@ -28,17 +28,32 @@ from yt_dlp.version import __version__ as YTDLP_VERSION
 
 from api.models import (
     AnalyzeRequest,
+    BatchQueueRequest,
+    FilePickRequest,
     FolderPickRequest,
+    MediaJobRequest,
+    PlaylistRequest,
+    ProbeRequest,
     QueueItemRequest,
+    QueueMoveRequest,
     RevealRequest,
     SettingsUpdateRequest,
     SummaryRequest,
 )
+from core import media_tools
 from core.download_manager import DownloadManager, QueueItem
 from core.ffmpeg_locator import find_ffmpeg
+from core.media_jobs import MediaJobManager
+from core.media_tools import FFmpegMissing, MediaError
 from core.settings_manager import SettingsManager
 from core.summarizer import TranscriptUnavailable, build_summary
-from core.video_info import LinkType, VideoInfo, detect_link_type
+from core.video_info import (
+    BATCH_LINK_TYPES,
+    LinkType,
+    VideoInfo,
+    detect_link_type,
+    fetch_playlist_entries,
+)
 
 logger = logging.getLogger("neoloader.api")
 
@@ -71,7 +86,11 @@ def frontend_dist_dir() -> Path | None:
     return candidate if (candidate / "index.html").exists() else None
 
 
-def create_app(settings: SettingsManager, download_manager: DownloadManager) -> FastAPI:
+def create_app(
+    settings: SettingsManager,
+    download_manager: DownloadManager,
+    media_manager: MediaJobManager | None = None,
+) -> FastAPI:
     app = FastAPI(title="YouTube Downloader API")
     app.add_middleware(
         CORSMiddleware,
@@ -94,6 +113,10 @@ def create_app(settings: SettingsManager, download_manager: DownloadManager) -> 
     )
     app.state.analyze_cache: dict[str, tuple[float, dict]] = {}
     app.state.analyze_inflight: dict[str, asyncio.Future] = {}
+    # Разбор плейлиста/канала — тот же дорогой поход в YouTube, что и analyze,
+    # и делит с ним пул: параллельно с уже идущим разбором его всё равно не ускорить.
+    app.state.playlist_cache: dict[str, tuple[float, dict]] = {}
+    app.state.media = media_manager if media_manager is not None else MediaJobManager(settings)
 
     def emit_event(event: dict) -> None:
         """Thread-safe мост: вызывается из потока DownloadManager (Qt-сигналы),
@@ -145,6 +168,10 @@ def create_app(settings: SettingsManager, download_manager: DownloadManager) -> 
 
     download_manager.item_finished.connect(_on_item_finished, direct)
 
+    # MediaJobManager не на Qt-сигналах — ему достаточно одного callback'а наружу
+    # (см. core/media_jobs.py). Событие уходит в тот же WebSocket, что и загрузки.
+    app.state.media.on_event = emit_event
+
     @app.on_event("startup")
     async def _startup() -> None:
         app.state.loop = asyncio.get_running_loop()
@@ -154,6 +181,7 @@ def create_app(settings: SettingsManager, download_manager: DownloadManager) -> 
     async def _shutdown() -> None:
         app.state.analyze_pool.shutdown(wait=False, cancel_futures=True)
         app.state.summary_pool.shutdown(wait=False, cancel_futures=True)
+        app.state.media.shutdown()
 
     async def _broadcast_worker() -> None:
         while True:
@@ -184,7 +212,10 @@ def create_app(settings: SettingsManager, download_manager: DownloadManager) -> 
     # --- анализ ссылки ---
 
     def _analyze_blocking(url: str, link_type: str) -> dict:
-        return VideoInfo.fetch(url, noplaylist=link_type != LinkType.PLAYLIST, settings=settings)
+        # noplaylist=False только для ссылок, которые сами по себе являются списком
+        # (плейлист или канал) — иначе yt-dlp уходит качать весь микс из ссылки вида
+        # watch?v=...&list=RD... вместо одного видео.
+        return VideoInfo.fetch(url, noplaylist=link_type not in BATCH_LINK_TYPES, settings=settings)
 
     @app.post("/api/analyze")
     async def analyze(req: AnalyzeRequest):
@@ -243,17 +274,60 @@ def create_app(settings: SettingsManager, download_manager: DownloadManager) -> 
             logger.exception("Саммери не построено")
             raise HTTPException(500, detail={"code": "SUMMARY_FAILED", "message": str(exc)})
 
+    # --- список видео плейлиста/канала (пакетная загрузка) ---
+
+    @app.post("/api/playlist")
+    async def playlist(req: PlaylistRequest):
+        url = req.url.strip()
+        link_type = detect_link_type(url)
+        if link_type == LinkType.INVALID:
+            raise HTTPException(400, detail={"code": "INVALID_URL", "message": "Ссылка некорректна"})
+        if link_type not in BATCH_LINK_TYPES:
+            raise HTTPException(
+                400,
+                detail={"code": "INVALID_URL", "message": "Это ссылка на одно видео, а не на список"},
+            )
+
+        cache_key = f"{url}|{req.limit}"
+        cached = app.state.playlist_cache.get(cache_key)
+        if cached and time.monotonic() - cached[0] < ANALYZE_CACHE_TTL:
+            return cached[1]
+
+        loop = asyncio.get_running_loop()
+        try:
+            data = await loop.run_in_executor(
+                app.state.analyze_pool,
+                lambda: fetch_playlist_entries(url, settings=settings, limit=max(1, min(500, req.limit))),
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(422, detail={"code": "VIDEO_UNAVAILABLE", "message": str(exc)})
+
+        app.state.playlist_cache[cache_key] = (time.monotonic(), data)
+        if len(app.state.playlist_cache) > 20:
+            oldest = min(app.state.playlist_cache, key=lambda k: app.state.playlist_cache[k][0])
+            app.state.playlist_cache.pop(oldest, None)
+        return data
+
     # --- очередь ---
+
+    def _queue_row(index: int, item: QueueItem) -> dict:
+        return {
+            "id": item.id,
+            "url": item.url,
+            "title": item.title,
+            "status": item.status,
+            "position": index,
+            "quality": item.quality,
+            "audio_only": item.audio_only,
+            "is_playlist": item.is_playlist,
+            "neuro_dub_ru": item.neuro_dub_ru,
+        }
 
     @app.get("/api/queue")
     async def get_queue():
-        return [
-            {"id": i.id, "url": i.url, "title": i.title, "status": i.status}
-            for i in download_manager.get_queue_snapshot()
-        ]
+        return [_queue_row(n, i) for n, i in enumerate(download_manager.get_queue_snapshot())]
 
-    @app.post("/api/queue")
-    async def add_to_queue(req: QueueItemRequest):
+    def _enqueue(req: QueueItemRequest) -> dict:
         data = req.model_dump()
         if not data.get("output_folder"):
             # Фронтенд не шлёт output_folder на каждую загрузку — папка по умолчанию
@@ -263,19 +337,56 @@ def create_app(settings: SettingsManager, download_manager: DownloadManager) -> 
         download_manager.add_to_queue(item)
         return {"id": item.id, "url": item.url, "title": item.title, "status": item.status}
 
+    @app.post("/api/queue")
+    async def add_to_queue(req: QueueItemRequest):
+        return _enqueue(req)
+
+    @app.post("/api/queue/batch")
+    async def add_batch(req: BatchQueueRequest):
+        """Пакетная постановка выбранных видео плейлиста/канала.
+
+        Каждое видео становится ОТДЕЛЬНОЙ задачей, а не одной задачей «скачай плейлист»:
+        так работают пауза, отмена и повтор для конкретного ролика, а падение одного
+        видео (приватное, удалённое, с региональной блокировкой) не роняет весь пакет.
+        """
+        if not req.items:
+            raise HTTPException(400, detail={"code": "INVALID_URL", "message": "Список пуст"})
+        if len(req.items) > 500:
+            raise HTTPException(400, detail={"code": "INVALID_URL", "message": "Не больше 500 за раз"})
+        return [_enqueue(item) for item in req.items]
+
+    @app.post("/api/queue/pause_all")
+    async def pause_all():
+        return {"ok": True, "affected": download_manager.pause_all()}
+
+    @app.post("/api/queue/resume_all")
+    async def resume_all():
+        return {"ok": True, "affected": download_manager.resume_all()}
+
+    @app.delete("/api/queue")
+    async def clear_queue():
+        """Убирает всё, что ещё не начало качаться. Активные загрузки не трогает."""
+        return {"ok": True, "removed": download_manager.clear_pending()}
+
     @app.post("/api/queue/{item_id}/pause")
     async def pause_item(item_id: str):
-        if item_id not in download_manager.get_active_item_ids():
-            raise HTTPException(409, "Элемент сейчас не скачивается")
-        download_manager.pause_current(item_id)
+        # Пауза работает и для ожидающей задачи: «поставить очередь на паузу» иначе
+        # невозможно — остановишь текущую, и тут же стартует следующая.
+        if not download_manager.pause_item(item_id):
+            raise HTTPException(409, "Эту задачу нельзя поставить на паузу")
         return {"ok": True}
 
     @app.post("/api/queue/{item_id}/resume")
     async def resume_item(item_id: str):
-        if item_id not in download_manager.get_active_item_ids():
-            raise HTTPException(409, "Элемент сейчас не скачивается")
-        download_manager.resume_current(item_id)
+        if not download_manager.resume_item(item_id):
+            raise HTTPException(409, "Эта задача не на паузе")
         return {"ok": True}
+
+    @app.post("/api/queue/{item_id}/move")
+    async def move_item(item_id: str, req: QueueMoveRequest):
+        if not download_manager.move_item(item_id, req.delta):
+            raise HTTPException(409, "Эту задачу нельзя переместить")
+        return {"ok": True, "queue": [_queue_row(n, i) for n, i in enumerate(download_manager.get_queue_snapshot())]}
 
     @app.post("/api/queue/{item_id}/cancel")
     async def cancel_item(item_id: str):
@@ -335,6 +446,73 @@ def create_app(settings: SettingsManager, download_manager: DownloadManager) -> 
         target = req.path or settings.get("download_folder", "")
         return {"ok": dialogs.reveal(target)}
 
+    # --- локальный конвертер/редактор (ffmpeg) ---
+
+    @app.get("/api/media/capabilities")
+    async def media_capabilities():
+        """Контейнеры и кодеки, доступные на ЭТОЙ машине. Единственный источник правды:
+        списки зависят от сборки ffmpeg, и хардкодить их во фронтенде значит обещать
+        пользователю кодек, которого у него нет."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, media_tools.capabilities)
+
+    @app.post("/api/media/pick")
+    async def media_pick(req: FilePickRequest):
+        """Нативный выбор файлов. Браузерный <input type=file> отдаёт File без пути
+        на диске, а ffmpeg работает именно с путём."""
+        from ui import dialogs
+
+        loop = asyncio.get_running_loop()
+        paths = await loop.run_in_executor(
+            None,
+            lambda: dialogs.pick_files(
+                start=req.start or settings.get("download_folder", ""),
+                multiple=req.multiple,
+                audio_only=req.audio_only,
+                title=req.title,
+            ),
+        )
+        return {"paths": paths}
+
+    @app.post("/api/media/probe")
+    async def media_probe(req: ProbeRequest):
+        loop = asyncio.get_running_loop()
+        try:
+            info = await loop.run_in_executor(app.state.summary_pool, media_tools.probe, req.path)
+        except FFmpegMissing as exc:
+            raise HTTPException(422, detail={"code": "FFMPEG_MISSING", "message": str(exc)})
+        except MediaError as exc:
+            raise HTTPException(422, detail={"code": "MEDIA_FAILED", "message": str(exc)})
+        return info.to_dict()
+
+    @app.get("/api/media/jobs")
+    async def media_jobs():
+        return app.state.media.snapshot()
+
+    @app.post("/api/media/jobs")
+    async def media_submit(req: MediaJobRequest):
+        params = req.model_dump(exclude={"kind", "source"}, exclude_none=True)
+        # Пустая строка в container/audio_source значит «не задано» — если её пропустить
+        # дальше, plan_* примет её за явный выбор и упадёт на «Неизвестный контейнер: ».
+        params = {k: v for k, v in params.items() if v != ""}
+        try:
+            job = app.state.media.submit(req.kind, req.source, params)
+        except FFmpegMissing as exc:
+            raise HTTPException(422, detail={"code": "FFMPEG_MISSING", "message": str(exc)})
+        except MediaError as exc:
+            raise HTTPException(422, detail={"code": "MEDIA_FAILED", "message": str(exc)})
+        return job.to_dict()
+
+    @app.post("/api/media/jobs/{job_id}/cancel")
+    async def media_cancel(job_id: str):
+        if not app.state.media.cancel(job_id):
+            raise HTTPException(409, "Задача уже завершена")
+        return {"ok": True}
+
+    @app.delete("/api/media/jobs")
+    async def media_clear():
+        return {"ok": True, "removed": app.state.media.clear_finished()}
+
     # --- диагностика / yt-dlp ---
 
     @app.get("/api/diagnostics")
@@ -344,6 +522,8 @@ def create_app(settings: SettingsManager, download_manager: DownloadManager) -> 
             "ffmpeg_installed": find_ffmpeg() is not None,
             "frozen": bool(getattr(sys, "frozen", False)),
             "summary_api_key_set": bool(str(settings.get("summary_api_key", "")).strip()),
+            "video_encoders": media_tools.supported_video_codecs(),
+            "audio_encoders": media_tools.supported_audio_codecs(),
         }
 
     @app.post("/api/ytdlp/update")

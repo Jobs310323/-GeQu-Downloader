@@ -3,8 +3,10 @@ import { Sidebar, type Page } from "./components/layout/Sidebar";
 import { UrlInput } from "./components/download/UrlInput";
 import { VideoPreview, VideoPreviewSkeleton } from "./components/download/VideoPreview";
 import { FormatSelector, type FormatState } from "./components/download/FormatSelector";
+import { PlaylistPicker } from "./components/download/PlaylistPicker";
 import { DownloadButton } from "./components/download/DownloadButton";
 import { DownloadQueue } from "./components/download/DownloadQueue";
+import { ConvertPage } from "./components/convert/ConvertPage";
 import { ErrorModal } from "./components/modals/ErrorModal";
 import { SummaryModal } from "./components/modals/SummaryModal";
 import { ToastStack } from "./components/ui/Toast";
@@ -12,9 +14,10 @@ import { OfflineBanner } from "./components/ui/OfflineBanner";
 import { HistoryPage } from "./components/history/HistoryList";
 import { SettingsPage } from "./components/settings/Settings";
 import { useDownloads } from "./hooks/useDownloads";
+import { useMediaJobs } from "./hooks/useMediaJobs";
 import { useSettings } from "./context/SettingsContext";
 import { api, ApiError } from "./services/api";
-import type { Quality, VideoInfo } from "./types/download";
+import type { QueueItemRequest, Quality, VideoInfo } from "./types/download";
 import { useT } from "./i18n/translations";
 
 const DEFAULT_FORMAT: FormatState = {
@@ -38,7 +41,21 @@ export default function App() {
   const [format, setFormat] = useState<FormatState>(DEFAULT_FORMAT);
   const [summaryOpen, setSummaryOpen] = useState(false);
 
-  const { jobs, logs, addToQueue, pause, resume, cancel, dismiss } = useDownloads();
+  const {
+    jobs,
+    logs,
+    addToQueue,
+    addBatch,
+    pause,
+    resume,
+    cancel,
+    move,
+    pauseAll,
+    resumeAll,
+    clearPending,
+    dismiss,
+  } = useDownloads();
+  const media = useMediaJobs();
   const { settings } = useSettings();
   const t = useT();
 
@@ -59,6 +76,8 @@ export default function App() {
       audioFormat: settings?.audio_format || DEFAULT_FORMAT.audioFormat,
       audioBitrate: settings?.audio_bitrate || DEFAULT_FORMAT.audioBitrate,
       outputContainer: settings?.output_container || DEFAULT_FORMAT.outputContainer,
+      videoCodec: settings?.default_video_codec || DEFAULT_FORMAT.videoCodec,
+      audioCodec: settings?.default_audio_codec || DEFAULT_FORMAT.audioCodec,
     }),
     [settings]
   );
@@ -71,7 +90,10 @@ export default function App() {
   }, [defaultFormat]);
 
   const activeCount = useMemo(
-    () => jobs.filter((j) => j.status !== "completed" && j.status !== "failed" && j.status !== "cancelled").length,
+    () =>
+      jobs.filter(
+        (j) => j.status !== "completed" && j.status !== "failed" && j.status !== "cancelled"
+      ).length,
     [jobs]
   );
 
@@ -126,11 +148,10 @@ export default function App() {
     // сетевой разбор ссылки на ровном месте — см. комментарий к useT.
   }, [url]);
 
-  const handleDownload = useCallback(async () => {
-    if (!info) return;
-    await addToQueue({
-      url,
-      title: info.title,
+  /** Общие для всех задач параметры формата — одно место, чтобы одиночная и пакетная
+   *  загрузка не разъезжались в настройках. */
+  const formatPayload = useCallback(
+    (): Omit<QueueItemRequest, "url" | "title"> => ({
       quality: format.quality,
       audio_only: format.audioOnly,
       audio_format: format.audioFormat,
@@ -139,18 +160,53 @@ export default function App() {
       audio_codec: format.audioCodec,
       output_container: format.outputContainer,
       subtitles: format.subtitles,
-      neuro_dub_ru: format.neuroDubRu && info.has_ru_dub,
-      is_playlist: info.is_playlist,
       // Эти два флага живут в настройках, но раньше никогда не доезжали до задачи —
       // бэкенд подставлял свои дефолты, и переключатели в настройках ничего не меняли.
       create_playlist_folder: settings?.create_playlist_folder ?? true,
       remove_after_download: settings?.remove_after_download ?? false,
-    });
+    }),
+    [format, settings]
+  );
+
+  const resetForm = useCallback(() => {
     setUrl("");
     setInfo(null);
     formatTouched.current = false;
     setFormat(defaultFormat);
-  }, [addToQueue, url, info, format, settings, defaultFormat]);
+  }, [defaultFormat]);
+
+  const handleDownload = useCallback(async () => {
+    if (!info) return;
+    await addToQueue({
+      url,
+      title: info.title,
+      ...formatPayload(),
+      neuro_dub_ru: format.neuroDubRu && info.has_ru_dub,
+      is_playlist: info.is_playlist,
+    });
+    resetForm();
+  }, [addToQueue, url, info, format.neuroDubRu, formatPayload, resetForm]);
+
+  /** Пакетная постановка выбранных видео плейлиста или канала. Каждое видео — своя
+   *  задача: работают пауза, отмена и повтор для конкретного ролика. */
+  const handleBatchDownload = useCallback(
+    async (entries: { url: string; title: string }[]) => {
+      const payload = formatPayload();
+      await addBatch(
+        entries.map((e) => ({
+          url: e.url,
+          title: e.title,
+          ...payload,
+          // Русская дорожка резолвится для каждого ролика отдельно уже при скачивании:
+          // из плоского списка плейлиста узнать, есть ли она, невозможно в принципе.
+          neuro_dub_ru: format.neuroDubRu,
+          is_playlist: false,
+        }))
+      );
+      resetForm();
+    },
+    [addBatch, format.neuroDubRu, formatPayload, resetForm]
+  );
 
   const patchFormat = useCallback((p: Partial<FormatState>) => {
     formatTouched.current = true;
@@ -162,9 +218,18 @@ export default function App() {
     setUrl(redownloadUrl);
   }, []);
 
+  const isBatchLink = Boolean(
+    info && (info.is_playlist || info.link_type === "playlist" || info.link_type === "channel")
+  );
+
   return (
     <div className="flex h-full">
-      <Sidebar page={page} onNavigate={setPage} activeCount={activeCount} />
+      <Sidebar
+        page={page}
+        onNavigate={setPage}
+        activeCount={activeCount}
+        convertCount={media.activeCount}
+      />
 
       <main className="flex-1 overflow-y-auto px-8">
         <div className="max-w-2xl mx-auto pt-4 empty:hidden">
@@ -189,8 +254,16 @@ export default function App() {
 
             {info && (
               <>
-                <FormatSelector state={format} onChange={patchFormat} ruDubAvailable={info.has_ru_dub} />
-                <DownloadButton onClick={handleDownload} />
+                <FormatSelector
+                  state={format}
+                  onChange={patchFormat}
+                  ruDubAvailable={info.has_ru_dub}
+                />
+                {isBatchLink ? (
+                  <PlaylistPicker url={info.webpage_url || url} onDownload={handleBatchDownload} />
+                ) : (
+                  <DownloadButton onClick={handleDownload} />
+                )}
               </>
             )}
 
@@ -198,11 +271,29 @@ export default function App() {
               <div className="flex items-center justify-between mb-2">
                 <h2 className="text-sm font-medium text-text-muted">{t("download.active")}</h2>
               </div>
-              <DownloadQueue jobs={jobs} onPause={pause} onResume={resume} onCancel={cancel} onDismiss={dismiss} />
+              <DownloadQueue
+                jobs={jobs}
+                onPause={pause}
+                onResume={resume}
+                onCancel={cancel}
+                onDismiss={dismiss}
+                onMove={move}
+                onPauseAll={pauseAll}
+                onResumeAll={resumeAll}
+                onClear={clearPending}
+              />
             </div>
           </div>
         )}
 
+        {page === "convert" && (
+          <ConvertPage
+            jobs={media.jobs}
+            onSubmit={media.submit}
+            onCancel={media.cancel}
+            onClear={media.clearFinished}
+          />
+        )}
         {page === "history" && <HistoryPage onRedownload={handleRedownload} />}
         {page === "settings" && <SettingsPage />}
       </main>

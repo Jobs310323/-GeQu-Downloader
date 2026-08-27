@@ -1,21 +1,24 @@
-import { Download, History, Plus, Settings as SettingsIcon } from "lucide-react";
+import { Download, History, Plus, Settings as SettingsIcon, Wand2 } from "lucide-react";
 import { APP_NAME } from "../../config/app";
 import { useT } from "../../i18n/translations";
 
-export type Page = "home" | "history" | "settings";
+export type Page = "home" | "convert" | "history" | "settings";
 
 export function Sidebar({
   page,
   onNavigate,
   activeCount,
+  convertCount = 0,
 }: {
   page: Page;
   onNavigate: (p: Page) => void;
   activeCount: number;
+  convertCount?: number;
 }) {
   const t = useT();
   const NAV: { id: Page; label: string; icon: typeof Download }[] = [
     { id: "home", label: t("nav.newDownload"), icon: Plus },
+    { id: "convert", label: t("nav.convert"), icon: Wand2 },
     { id: "history", label: t("nav.history"), icon: History },
   ];
   return (
@@ -43,6 +46,9 @@ export function Sidebar({
             {id === "home" && activeCount > 0 && (
               <span className="ml-auto text-xs text-primary font-mono">{activeCount}</span>
             )}
+            {id === "convert" && convertCount > 0 && (
+              <span className="ml-auto text-xs text-primary font-mono">{convertCount}</span>
+            )}
           </button>
         ))}
       </nav>
@@ -59,7 +65,7 @@ export function Sidebar({
           <SettingsIcon size={16} />
           {t("nav.settings")}
         </button>
-        <div className="px-3 pt-2 text-xs text-text-faint font-mono">v2.0.0</div>
+        <div className="px-3 pt-2 text-xs text-text-faint font-mono">v2.1.0</div>
       </div>
     </aside>
   );

@@ -27,6 +27,7 @@ from PyQt6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 from api.server import create_app  # noqa: E402
 from core.download_manager import DownloadManager  # noqa: E402
 from core.logging_setup import configure_logging, log_dir  # noqa: E402
+from core.media_jobs import MediaJobManager  # noqa: E402
 from core.settings_manager import SettingsManager  # noqa: E402
 from ui.single_instance import SingleInstanceServer, try_acquire  # noqa: E402
 
@@ -79,9 +80,18 @@ class ApiSupervisor:
     приложения, причём снаружи это выглядит просто как «ничего не работает».
     """
 
-    def __init__(self, settings: SettingsManager, download_manager: DownloadManager) -> None:
+    def __init__(
+        self,
+        settings: SettingsManager,
+        download_manager: DownloadManager,
+        media_manager: MediaJobManager,
+    ) -> None:
         self._settings = settings
         self._download_manager = download_manager
+        # Менеджер ffmpeg-задач живёт ДОЛЬШЕ приложения FastAPI: при перезапуске
+        # uvicorn создаётся новый app, и если бы очередь конвертаций принадлежала ему,
+        # она бы обнулялась вместе с ним — прямо посреди часового перекодирования.
+        self._media_manager = media_manager
         self._ready = threading.Event()
         self._stopped = False
         self.port = API_PORT
@@ -119,7 +129,7 @@ class ApiSupervisor:
 
     def _serve_once(self) -> None:
         self.port = _pick_port()
-        app = create_app(self._settings, self._download_manager)
+        app = create_app(self._settings, self._download_manager, self._media_manager)
 
         @app.on_event("startup")
         async def _signal_ready() -> None:  # noqa: ANN202
@@ -198,8 +208,9 @@ def main() -> None:
 
     settings = SettingsManager()
     download_manager = DownloadManager(settings)
+    media_manager = MediaJobManager(settings)
 
-    supervisor = ApiSupervisor(settings, download_manager)
+    supervisor = ApiSupervisor(settings, download_manager, media_manager)
     supervisor.start()
     # В собранном EXE импорт FastAPI/uvicorn/yt-dlp из запакованного PYZ-архива на холодном
     # старте заметно медленнее, чем из обычных .py на диске — окно (и React внутри него)
@@ -235,6 +246,7 @@ def main() -> None:
 
     exit_code = app.exec()
     supervisor.stop()
+    media_manager.shutdown()  # оборвать ffmpeg-процессы и убрать недописанные файлы
     sys.exit(exit_code)
 
 

@@ -48,6 +48,10 @@ if not logger.handlers:
 # Минимум свободного места на диске перед стартом загрузки (500 МБ с запасом на постобработку).
 MIN_FREE_SPACE_BYTES = 500 * 1024 * 1024
 
+# Кодеки, которые понимает yt-dlp'шный FFmpegExtractAudio. Всё, чего здесь нет
+# (в частности "original"), означает «оставить поток как скачался».
+AUDIO_EXTRACT_CODECS = frozenset({"aac", "alac", "flac", "m4a", "mp3", "opus", "vorbis", "wav"})
+
 STATUS_PENDING = "queued"
 STATUS_ANALYZING = "analyzing"
 STATUS_RESOLVING = "resolving"
@@ -151,6 +155,76 @@ class DownloadManager(QThread):
         with self._lock:
             return list(self._queue)
 
+    def move_item(self, item_id: str, delta: int) -> bool:
+        """Сдвигает ОЖИДАЮЩУЮ задачу по очереди. Активные не двигаем: их порядок уже
+        ничего не решает (они качаются), а перестановка сбивала бы нумерацию в UI."""
+        with self._lock:
+            index = next((n for n, i in enumerate(self._queue) if i.id == item_id), None)
+            if index is None:
+                return False
+            item = self._queue[index]
+            if item.status not in (STATUS_PENDING, STATUS_PAUSED):
+                return False
+            target = max(0, min(len(self._queue) - 1, index + delta))
+            if target == index:
+                return False
+            self._queue.insert(target, self._queue.pop(index))
+            return True
+
+    def pause_item(self, item_id: str) -> bool:
+        """Пауза для ЛЮБОГО элемента — и качающегося, и ещё ожидающего.
+
+        Раньше пауза работала только для активной задачи, поэтому «поставить очередь
+        на паузу» было невозможно: остановишь текущую — тут же стартует следующая.
+        Ожидающая задача переводится в PAUSED, а _launch_available берёт только PENDING,
+        так что она просто не запустится, пока её не вернут.
+        """
+        active = self._get_active(item_id)
+        if active is not None:
+            active.pause_event.clear()
+            self._set_status(active, STATUS_PAUSED)
+            self.log_message.emit("warning", "Загрузка приостановлена")
+            return True
+        with self._lock:
+            item = next((i for i in self._queue if i.id == item_id), None)
+        if item is None or item.status != STATUS_PENDING:
+            return False
+        self._set_status(item, STATUS_PAUSED)
+        return True
+
+    def resume_item(self, item_id: str) -> bool:
+        active = self._get_active(item_id)
+        if active is not None:
+            active.pause_event.set()
+            self._set_status(active, STATUS_DOWNLOADING)
+            self.log_message.emit("info", "Загрузка возобновлена")
+            self._wake.set()  # освободившийся слот мог ждать именно её
+            return True
+        with self._lock:
+            item = next((i for i in self._queue if i.id == item_id), None)
+        if item is None or item.status != STATUS_PAUSED:
+            return False
+        self._set_status(item, STATUS_PENDING)
+        self._wake.set()
+        return True
+
+    def pause_all(self) -> int:
+        ids = [i.id for i in self.get_queue_snapshot()] + self.get_active_item_ids()
+        return sum(1 for item_id in dict.fromkeys(ids) if self.pause_item(item_id))
+
+    def resume_all(self) -> int:
+        ids = [i.id for i in self.get_queue_snapshot()] + self.get_active_item_ids()
+        return sum(1 for item_id in dict.fromkeys(ids) if self.resume_item(item_id))
+
+    def clear_pending(self) -> int:
+        """Убирает из очереди всё, что ещё не начало качаться. Активные не трогает —
+        их обрывают отдельной отменой, чтобы не потерять уже скачанные гигабайты молча."""
+        active = set(self.get_active_item_ids())
+        with self._lock:
+            before = len(self._queue)
+            self._queue = [i for i in self._queue if i.id in active]
+            return before - len(self._queue)
+
     def get_current_item_id(self) -> str | None:
         """Id первой активной (реально скачивающейся) задачи, или None.
         При concurrent_downloads=1 (по умолчанию) это единственная активная задача —
@@ -170,20 +244,15 @@ class DownloadManager(QThread):
             return next(iter(self._active_items.values()), None)
 
     def pause_current(self, item_id: str | None = None) -> None:
+        """Совместимость со старым виджетным UI: пауза «текущей» задачи."""
         item = self._get_active(item_id)
-        if item is None:
-            return
-        item.pause_event.clear()
-        self._set_status(item, STATUS_PAUSED)
-        self.log_message.emit("warning", "Загрузка приостановлена")
+        if item is not None:
+            self.pause_item(item.id)
 
     def resume_current(self, item_id: str | None = None) -> None:
         item = self._get_active(item_id)
-        if item is None:
-            return
-        item.pause_event.set()
-        self._set_status(item, STATUS_DOWNLOADING)
-        self.log_message.emit("info", "Загрузка возобновлена")
+        if item is not None:
+            self.resume_item(item.id)
 
     def cancel_current(self, item_id: str | None = None) -> None:
         item = self._get_active(item_id)
@@ -575,13 +644,20 @@ class DownloadManager(QThread):
                 opts["cookiesfrombrowser"] = (cookies_browser,)
 
         if item.audio_only:
-            opts["postprocessors"] = [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": item.audio_format,
-                    "preferredquality": item.audio_bitrate,
-                }
-            ]
+            # "original" = вообще не запускать постпроцессор: скачанный аудиопоток
+            # остаётся ровно таким, каким его отдал YouTube (обычно opus в .webm или
+            # aac в .m4a). Это единственный по-настоящему без потерь вариант — любая
+            # перекодировка в mp3 из lossy-источника режет качество ещё раз.
+            # Раньше "original" уходил в preferredcodec как есть, а yt-dlp такого
+            # кодека не знает — постпроцессор падал на списке поддерживаемых.
+            if item.audio_format in AUDIO_EXTRACT_CODECS:
+                opts["postprocessors"] = [
+                    {
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": item.audio_format,
+                        "preferredquality": item.audio_bitrate,
+                    }
+                ]
         else:
             opts["merge_output_format"] = item.output_container or "mp4"
 
@@ -609,10 +685,20 @@ class DownloadManager(QThread):
             # точка прервать скачивание, т.к. QThread.terminate() может повредить файл.
             if item.cancelled:
                 raise DownloadCancelledError()
-            while not item.pause_event.is_set():
-                time.sleep(0.2)
-                if item.cancelled:
-                    raise DownloadCancelledError()
+            if not item.pause_event.is_set():
+                # Паузу могли нажать, пока задача ещё анализировалась: тогда флаг снят,
+                # а статус успел перезаписаться на analyzing/downloading следующим шагом
+                # пайплайна. Здесь — первая точка, где пауза реально вступает в силу,
+                # поэтому статус приводим в соответствие именно тут, иначе интерфейс
+                # показывает «качается» у намертво замершей задачи.
+                if item.status != STATUS_PAUSED:
+                    self._set_status(item, STATUS_PAUSED)
+                while not item.pause_event.is_set():
+                    time.sleep(0.2)
+                    if item.cancelled:
+                        raise DownloadCancelledError()
+                if item.status == STATUS_PAUSED:
+                    self._set_status(item, STATUS_DOWNLOADING)
 
             if d["status"] == "downloading":
                 if item.status != STATUS_DOWNLOADING:

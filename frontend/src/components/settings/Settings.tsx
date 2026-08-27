@@ -5,11 +5,14 @@ import { useSettings } from "../../context/SettingsContext";
 import { useT } from "../../i18n/translations";
 import {
   AUDIO_BITRATE_OPTIONS,
+  AUDIO_CODEC_OPTIONS,
   AUDIO_FORMAT_OPTIONS,
   COOKIES_BROWSER_OPTIONS,
+  LOSSLESS_AUDIO_FORMATS,
   OUTPUT_CONTAINER_OPTIONS,
   QUALITY_OPTIONS,
   SUMMARY_MODEL_OPTIONS,
+  VIDEO_CODEC_OPTIONS,
   type Diagnostics,
   type Settings as SettingsType,
 } from "../../types/download";
@@ -228,11 +231,29 @@ export function SettingsPage() {
             onChange={(v) => patch({ audio_format: v })}
           />
         </Row>
-        <Row label={t("settings.audioBitrate")}>
+        {/* У FLAC/WAV/ALAC и у режима «как есть» битрейта не существует —
+            селектор в этом случае обещал бы настройку, которая ничего не меняет. */}
+        {!LOSSLESS_AUDIO_FORMATS.includes(settings.audio_format) && (
+          <Row label={t("settings.audioBitrate")}>
+            <Dropdown
+              value={settings.audio_bitrate}
+              options={[...AUDIO_BITRATE_OPTIONS]}
+              onChange={(v) => patch({ audio_bitrate: v })}
+            />
+          </Row>
+        )}
+        <Row label={t("settings.defaultVideoCodec")}>
           <Dropdown
-            value={settings.audio_bitrate}
-            options={[...AUDIO_BITRATE_OPTIONS]}
-            onChange={(v) => patch({ audio_bitrate: v })}
+            value={settings.default_video_codec ?? "any"}
+            options={[...VIDEO_CODEC_OPTIONS]}
+            onChange={(v) => patch({ default_video_codec: v })}
+          />
+        </Row>
+        <Row label={t("settings.defaultAudioCodec")}>
+          <Dropdown
+            value={settings.default_audio_codec ?? "any"}
+            options={[...AUDIO_CODEC_OPTIONS]}
+            onChange={(v) => patch({ default_audio_codec: v })}
           />
         </Row>
       </section>

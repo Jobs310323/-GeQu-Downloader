@@ -24,13 +24,42 @@ logger = logging.getLogger("neoloader.dialogs")
 DIALOG_TIMEOUT_SECONDS = 300
 
 
+MEDIA_FILTER = (
+    "Медиафайлы (*.mp4 *.mkv *.webm *.mov *.avi *.ts *.flv *.m4v *.mpg *.mpeg "
+    "*.mp3 *.m4a *.aac *.opus *.ogg *.flac *.wav *.ac3 *.wma);;Все файлы (*.*)"
+)
+AUDIO_FILTER = "Аудио (*.mp3 *.m4a *.aac *.opus *.ogg *.flac *.wav *.ac3);;Все файлы (*.*)"
+
+
 class _DialogBridge(QObject):
     folder_requested = pyqtSignal(object)
+    files_requested = pyqtSignal(object)
 
     def __init__(self) -> None:
         super().__init__()
         self.parent_window = None
         self.folder_requested.connect(self._open_folder_dialog)
+        self.files_requested.connect(self._open_files_dialog)
+
+    def _open_files_dialog(self, box: dict) -> None:
+        try:
+            if box.get("multiple"):
+                paths, _ = QFileDialog.getOpenFileNames(
+                    self.parent_window, box.get("title") or "Выберите файлы",
+                    box.get("start") or "", box.get("filter") or MEDIA_FILTER,
+                )
+            else:
+                path, _ = QFileDialog.getOpenFileName(
+                    self.parent_window, box.get("title") or "Выберите файл",
+                    box.get("start") or "", box.get("filter") or MEDIA_FILTER,
+                )
+                paths = [path] if path else []
+            box["paths"] = paths
+        except Exception:  # noqa: BLE001 — диалог не должен ронять приложение
+            logger.exception("Не удалось открыть диалог выбора файлов")
+            box["paths"] = []
+        finally:
+            box["event"].set()
 
     def _open_folder_dialog(self, box: dict) -> None:
         try:
@@ -76,6 +105,27 @@ def pick_folder(start: str = "") -> str:
         logger.warning("Диалог выбора папки не ответил за %s с", DIALOG_TIMEOUT_SECONDS)
         return ""
     return box["path"]
+
+
+def pick_files(start: str = "", multiple: bool = True, audio_only: bool = False, title: str = "") -> list:
+    """Нативный выбор файлов. Браузерный <input type="file"> здесь не годится
+    принципиально: он отдаёт объект File без пути на диске, а ffmpeg нужен именно
+    путь — иначе пришлось бы перекачивать гигабайты через HTTP в свой же процесс."""
+    if _bridge is None:
+        return []
+    box: dict = {
+        "start": start,
+        "multiple": multiple,
+        "filter": AUDIO_FILTER if audio_only else MEDIA_FILTER,
+        "title": title,
+        "paths": [],
+        "event": threading.Event(),
+    }
+    _bridge.files_requested.emit(box)
+    if not box["event"].wait(timeout=DIALOG_TIMEOUT_SECONDS):
+        logger.warning("Диалог выбора файлов не ответил за %s с", DIALOG_TIMEOUT_SECONDS)
+        return []
+    return [p for p in box["paths"] if p]
 
 
 def reveal(path: str) -> bool:

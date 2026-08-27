@@ -1,5 +1,5 @@
 import { motion } from "framer-motion";
-import { AlertCircle, CheckCircle2, Pause, Play, VideoIcon, X } from "lucide-react";
+import { AlertCircle, ArrowDown, ArrowUp, CheckCircle2, Pause, Play, VideoIcon, X } from "lucide-react";
 import type { DownloadJob } from "../../types/download";
 
 const STATUS_LABEL: Record<string, string> = {
@@ -36,16 +36,26 @@ export function DownloadCard({
   onResume,
   onCancel,
   onDismiss,
+  onMove,
+  canMoveUp,
+  canMoveDown,
 }: {
   job: DownloadJob;
   onPause: () => void;
   onResume: () => void;
   onCancel: () => void;
   onDismiss: () => void;
+  onMove?: (delta: number) => void;
+  canMoveUp?: boolean;
+  canMoveDown?: boolean;
 }) {
-  const active = job.status === "downloading" || job.status === "paused";
   const finished = job.status === "completed";
   const terminal = ["completed", "failed", "cancelled"].includes(job.status);
+  // Пауза доступна не только качающейся задаче, но и ожидающей: иначе «придержать
+  // очередь» невозможно — остановишь текущую, и тут же стартует следующая.
+  const pausable = !terminal;
+  // Переставлять имеет смысл только то, что ещё не начало качаться.
+  const reorderable = job.status === "queued" || job.status === "paused";
 
   return (
     <motion.div
@@ -93,7 +103,27 @@ export function DownloadCard({
 
       <div className="flex items-center gap-1 shrink-0">
         {finished && <CheckCircle2 size={16} className="text-success" />}
-        {active && (
+        {reorderable && onMove && (
+          <>
+            <button
+              onClick={() => onMove(-1)}
+              disabled={!canMoveUp}
+              className="p-1 rounded-lg text-text-faint hover:text-text hover:bg-surface-elevated transition-colors disabled:opacity-30 disabled:hover:text-text-faint"
+              aria-label="Move up"
+            >
+              <ArrowUp size={13} />
+            </button>
+            <button
+              onClick={() => onMove(1)}
+              disabled={!canMoveDown}
+              className="p-1 rounded-lg text-text-faint hover:text-text hover:bg-surface-elevated transition-colors disabled:opacity-30 disabled:hover:text-text-faint"
+              aria-label="Move down"
+            >
+              <ArrowDown size={13} />
+            </button>
+          </>
+        )}
+        {pausable && (
           <button
             onClick={job.status === "paused" ? onResume : onPause}
             className="p-1.5 rounded-lg text-text-muted hover:text-text hover:bg-surface-elevated transition-colors"

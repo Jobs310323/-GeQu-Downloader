@@ -32,6 +32,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "audio_only": False,
     "audio_format": "mp3",
     "audio_bitrate": "192",
+    # Кодеки по умолчанию для новой загрузки. "any" = пусть резолвер берёт лучший
+    # доступный поток; раньше выбор кодека жил только в форме одной загрузки и
+    # сбрасывался на "any" после каждой.
+    "default_video_codec": "any",
+    "default_audio_codec": "any",
     "create_playlist_folder": True,
     "remove_after_download": False,
     "concurrent_downloads": 1,
