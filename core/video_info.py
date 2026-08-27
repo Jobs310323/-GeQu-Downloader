@@ -20,6 +20,15 @@ TIMESTAMP_RE = re.compile(r"[?&]t=(\d+)")
 # хвостом /videos, /streams, /shorts, /playlists.
 CHANNEL_RE = re.compile(r"youtube\.com/(@[\w.-]+|channel/[\w-]+|c/[\w.-]+|user/[\w.-]+)")
 
+# Rutube: домен либо rutube.ru, либо личный поддомен my.rutube.ru.
+RUTUBE_HOST_RE = re.compile(r"(?:^|//|\.)rutube\.ru", re.I)
+# Обычное видео: /video/<32-символьный hex id>/, встраиваемый плеер: /play/embed/<id>.
+RUTUBE_VIDEO_RE = re.compile(r"rutube\.ru/(?:video|play/embed)/([0-9a-f]+)", re.I)
+# Плейлист: /plst/<id>/ либо /video/<id>/?pl_id=<id> (плейлист приклеен к ссылке на видео).
+RUTUBE_PLAYLIST_RE = re.compile(r"rutube\.ru/plst/(\d+)|[?&]pl_id=(\d+)", re.I)
+# Канал/персона: /channel/<id>/, /u/<handle>/ (и tv-каналы /tv/<slug>/).
+RUTUBE_CHANNEL_RE = re.compile(r"rutube\.ru/(?:channel/[\w-]+|u/[\w.-]+|tv/[\w-]+)", re.I)
+
 
 class LinkType:
     VIDEO = "video"
@@ -33,10 +42,7 @@ class LinkType:
 BATCH_LINK_TYPES = (LinkType.PLAYLIST, LinkType.CHANNEL)
 
 
-def detect_link_type(url: str) -> str:
-    """Определяет тип ссылки по URL, не обращаясь в сеть."""
-    if not url or "youtu" not in url:
-        return LinkType.INVALID
+def _detect_youtube_link_type(url: str) -> str:
     if "/shorts/" in url:
         return LinkType.SHORT
     if PLAYLIST_RE.search(url) and "watch" not in url:
@@ -48,6 +54,30 @@ def detect_link_type(url: str) -> str:
     # хотя yt-dlp умеет это с самого начала.
     if CHANNEL_RE.search(url):
         return LinkType.CHANNEL
+    return LinkType.INVALID
+
+
+def _detect_rutube_link_type(url: str) -> str:
+    # Плейлист проверяем раньше видео: ссылка на видео внутри плейлиста
+    # (?pl_id=...) должна разворачиваться в пакетную загрузку, а не в одно видео.
+    if RUTUBE_PLAYLIST_RE.search(url):
+        return LinkType.PLAYLIST
+    if RUTUBE_VIDEO_RE.search(url):
+        return LinkType.VIDEO
+    if RUTUBE_CHANNEL_RE.search(url):
+        return LinkType.CHANNEL
+    return LinkType.INVALID
+
+
+def detect_link_type(url: str) -> str:
+    """Определяет тип ссылки по URL, не обращаясь в сеть. Поддерживаются YouTube и Rutube —
+    любой другой хост считается неподдерживаемым (INVALID), даже если сам yt-dlp его бы разобрал."""
+    if not url:
+        return LinkType.INVALID
+    if "youtu" in url:
+        return _detect_youtube_link_type(url)
+    if RUTUBE_HOST_RE.search(url):
+        return _detect_rutube_link_type(url)
     return LinkType.INVALID
 
 
@@ -168,8 +198,12 @@ CHANNEL_TABS = ("/videos", "/shorts", "/streams", "/playlists", "/featured", "/c
 
 
 def channel_videos_url(url: str) -> str:
-    """Для ссылки на канал без вкладки дописывает /videos; остальные ссылки не трогает."""
-    if detect_link_type(url) != LinkType.CHANNEL:
+    """Для ссылки на YouTube-канал без вкладки дописывает /videos; остальные ссылки не трогает.
+
+    Rutube-канал (/channel/<id>/, /u/<handle>/) отдаёт список роликов прямо по своему URL —
+    в отличие от YouTube там нет отдельной "вкладки" /videos, дописывать нечего.
+    """
+    if detect_link_type(url) != LinkType.CHANNEL or "youtu" not in url:
         return url
     trimmed = url.split("?")[0].rstrip("/")
     if any(trimmed.endswith(tab) for tab in CHANNEL_TABS):

@@ -63,6 +63,19 @@ STATUS_PAUSED = "paused"
 STATUS_DONE = "completed"
 STATUS_ERROR = "failed"
 STATUS_CANCELLED = "cancelled"
+# Соединение оборвалось и yt-dlp исчерпал собственные внутренние ретраи (retries/
+# fragment_retries) — ждём и пробуем ту же задачу заново, вместо того чтобы сразу
+# помечать её FAILED. См. DownloadManager._wait_for_reconnect.
+STATUS_RECONNECTING = "reconnecting"
+
+# Параметры повторных попыток при обрыве интернета целиком (не путать с retries/
+# fragment_retries yt-dlp — те гасят короткие, в пределах секунд, обрывы фрагментов
+# ВНУТРИ одного extract_info; здесь — то, что происходит, когда yt-dlp уже сдался
+# и бросил DownloadError). Экспоненциальная задержка с потолком, чтобы не долбить
+# сеть каждую секунду, но и не ждать часами: 5с, 10с, 20с, 40с, 60с, 60с, ...
+NETWORK_RETRY_BASE_DELAY = 5.0
+NETWORK_RETRY_MAX_DELAY = 60.0
+NETWORK_RETRY_MAX_ATTEMPTS = 50
 
 
 class DownloadCancelledError(Exception):
@@ -110,6 +123,9 @@ class QueueItem:
     # None — русская дорожка не запрашивалась; True/False — подтверждена/не подтверждена
     # по info_dict фактически скачанного потока (см. _verify_download).
     ru_dub_confirmed: bool | None = field(default=None, repr=False, compare=False)
+    # Сколько раз подряд задача уже уходила в STATUS_RECONNECTING из-за сетевой ошибки —
+    # см. NETWORK_RETRY_MAX_ATTEMPTS и DownloadManager._wait_for_reconnect.
+    network_retry_count: int = field(default=0, repr=False, compare=False)
 
 
 class DownloadManager(QThread):
@@ -288,11 +304,13 @@ class DownloadManager(QThread):
 
         to_launch: list[QueueItem] = []
         with self._lock:
-            # Задача на паузе всё ещё числится в _active_items (её поток жив, просто спит
-            # в progress_hook), но байты не качает — не должна занимать слот параллелизма,
-            # иначе следующая в очереди никогда не стартует, пока эту не снимут с паузы.
+            # Задача на паузе или в ожидании реконнекта всё ещё числится в _active_items
+            # (её поток жив, просто спит), но байты не качает — не должна занимать слот
+            # параллелизма, иначе следующая в очереди никогда не стартует.
             downloading_count = sum(
-                1 for i in self._active_items.values() if i.status != STATUS_PAUSED
+                1
+                for i in self._active_items.values()
+                if i.status not in (STATUS_PAUSED, STATUS_RECONNECTING)
             )
             slots = concurrency - downloading_count
             if slots > 0:
@@ -343,46 +361,97 @@ class DownloadManager(QThread):
             self._log_event("TASK_FAILED", item, reason="no_space")
             return
 
-        try:
-            final_path = self._run_pipeline(item)
-            self._set_status(item, STATUS_DONE)
-            self.log_message.emit("success", f"Готово: {item.title or item.url}")
-            self._log_event("DOWNLOAD_COMPLETED", item, path=final_path)
-            self.item_finished.emit(
-                item.id,
-                {
-                    "url": item.url,
-                    "title": item.title,
-                    # История раньше хранила только url+title, поэтому «Открыть папку»
-                    # и фильтры по дате/размеру были невозможны в принципе.
-                    "path": final_path or "",
-                    "size": os.path.getsize(final_path) if final_path and os.path.exists(final_path) else 0,
-                    "finished_at": time.time(),
-                    "audio_only": item.audio_only,
-                    "quality": item.quality,
-                    "ru_dub": item.ru_dub_confirmed,
-                },
-            )
-        except DownloadCancelledError:
-            self._set_status(item, STATUS_CANCELLED)
-            self.log_message.emit("warning", f"Отменено: {item.title or item.url}")
-            self._log_event("TASK_FAILED", item, reason="cancelled")
-        except (FormatSnapshotMismatch, DownloadVerificationError) as exc:
-            self._set_status(item, STATUS_ERROR)
-            self.error_occurred.emit(item.id, "unknown", str(exc))
-            self.log_message.emit("error", str(exc))
-            self._log_event("TASK_FAILED", item, reason=type(exc).__name__, error=str(exc))
-        except DownloadError as exc:
-            code, message = self._classify_error(str(exc))
-            self._set_status(item, STATUS_ERROR)
-            self.error_occurred.emit(item.id, code, message)
-            self.log_message.emit("error", message)
-            self._log_event("TASK_FAILED", item, reason=code)
-        except Exception as exc:  # noqa: BLE001 — любая непредвиденная ошибка должна дойти до UI, а не убить поток
-            self._set_status(item, STATUS_ERROR)
-            self.error_occurred.emit(item.id, "unknown", str(exc))
-            self.log_message.emit("error", str(exc))
-            self._log_event("TASK_FAILED", item, reason="unknown", error=str(exc))
+        # Цикл, а не одна попытка: сетевая ошибка ("интернет пропал") не проваливает
+        # задачу сразу — см. ветку DownloadError ниже. yt-dlp продолжает докачивать тот
+        # же .part-файл (continuedl — поведение по умолчанию), поэтому повторный заход
+        # в _run_pipeline после восстановления соединения не начинает загрузку с нуля.
+        while True:
+            try:
+                final_path = self._run_pipeline(item)
+                self._set_status(item, STATUS_DONE)
+                self.log_message.emit("success", f"Готово: {item.title or item.url}")
+                self._log_event("DOWNLOAD_COMPLETED", item, path=final_path)
+                self.item_finished.emit(
+                    item.id,
+                    {
+                        "url": item.url,
+                        "title": item.title,
+                        # История раньше хранила только url+title, поэтому «Открыть папку»
+                        # и фильтры по дате/размеру были невозможны в принципе.
+                        "path": final_path or "",
+                        "size": os.path.getsize(final_path) if final_path and os.path.exists(final_path) else 0,
+                        "finished_at": time.time(),
+                        "audio_only": item.audio_only,
+                        "quality": item.quality,
+                        "ru_dub": item.ru_dub_confirmed,
+                    },
+                )
+            except DownloadCancelledError:
+                self._set_status(item, STATUS_CANCELLED)
+                self.log_message.emit("warning", f"Отменено: {item.title or item.url}")
+                self._log_event("TASK_FAILED", item, reason="cancelled")
+            except (FormatSnapshotMismatch, DownloadVerificationError) as exc:
+                self._set_status(item, STATUS_ERROR)
+                self.error_occurred.emit(item.id, "unknown", str(exc))
+                self.log_message.emit("error", str(exc))
+                self._log_event("TASK_FAILED", item, reason=type(exc).__name__, error=str(exc))
+            except DownloadError as exc:
+                code, message = self._classify_error(str(exc))
+                if code == "network":
+                    should_retry = self._wait_for_reconnect(item)
+                    if item.cancelled:
+                        self._set_status(item, STATUS_CANCELLED)
+                        self.log_message.emit(
+                            "warning", f"Отменено при ожидании соединения: {item.title or item.url}"
+                        )
+                        self._log_event("TASK_FAILED", item, reason="cancelled")
+                        return
+                    if should_retry:
+                        continue  # соединение восстановилось (или предполагаем это) — пробуем заново
+                self._set_status(item, STATUS_ERROR)
+                self.error_occurred.emit(item.id, code, message)
+                self.log_message.emit("error", message)
+                self._log_event("TASK_FAILED", item, reason=code)
+            except Exception as exc:  # noqa: BLE001 — любая непредвиденная ошибка должна дойти до UI, а не убить поток
+                self._set_status(item, STATUS_ERROR)
+                self.error_occurred.emit(item.id, "unknown", str(exc))
+                self.log_message.emit("error", str(exc))
+                self._log_event("TASK_FAILED", item, reason="unknown", error=str(exc))
+            return
+
+    def _wait_for_reconnect(self, item: QueueItem) -> bool:
+        """Пауза перед повторной попыткой после сетевого обрыва — экспоненциальная задержка
+        с потолком (см. NETWORK_RETRY_*). Отмена проверяется каждые 0.2с, чтобы кнопка
+        "Отменить" срабатывала мгновенно, а не только после истечения полной паузы.
+
+        Возвращает True, если стоит повторить _run_pipeline (лимит попыток не исчерпан
+        и задачу не отменили за время ожидания), иначе False. Статус задачи оставляем
+        STATUS_RECONNECTING на всё время ожидания — если False из-за отмены, вызывающий
+        код сам переведёт её в STATUS_CANCELLED.
+        """
+        item.network_retry_count += 1
+        if item.network_retry_count > NETWORK_RETRY_MAX_ATTEMPTS:
+            self._log_event("NETWORK_RETRY_GIVEUP", item, attempts=item.network_retry_count - 1)
+            return False
+
+        delay = min(
+            NETWORK_RETRY_MAX_DELAY,
+            NETWORK_RETRY_BASE_DELAY * (2 ** (item.network_retry_count - 1)),
+        )
+        self._set_status(item, STATUS_RECONNECTING)
+        self.log_message.emit(
+            "warning",
+            f"Нет соединения с интернетом — попробую снова через {delay:.0f}с "
+            f"(попытка {item.network_retry_count})",
+        )
+        self._log_event("NETWORK_RETRY_WAIT", item, attempt=item.network_retry_count, delay=f"{delay:.0f}")
+
+        deadline = time.monotonic() + delay
+        while time.monotonic() < deadline:
+            if item.cancelled:
+                return False
+            time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
+        return True
 
     def _run_pipeline(self, item: QueueItem) -> str:
         """ANALYZING -> RESOLVING -> STARTING -> DOWNLOADING -> (MERGING/CONVERTING) -> проверка
@@ -438,9 +507,10 @@ class DownloadManager(QThread):
             attempt_opts = self._build_ydl_opts(item, result_holder)
             attempt_opts["format"] = plan.format_selector()
             # yt-dlp сам ретраит транзиентные сетевые обрывы (TCP reset, SSL EOF) внутри
-            # одного extract_info() — свой отдельный Python-цикл ретраев тут не нужен.
-            attempt_opts.setdefault("retries", 5)
-            attempt_opts.setdefault("fragment_retries", 5)
+            # одного extract_info() — свой отдельный Python-цикл ретраев тут не нужен
+            # (см. _build_ydl_opts: retries/fragment_retries). Более серьёзный обрыв,
+            # который переживает эти внутренние ретраи и всё же валит extract_info,
+            # ловится снаружи в _process_item и уходит в _wait_for_reconnect.
             log("DOWNLOAD_STARTED", plan=plan.label, selector=plan.format_selector())
             try:
                 with YoutubeDL(attempt_opts) as dl_ydl:
@@ -615,6 +685,20 @@ class DownloadManager(QThread):
             "noplaylist": not item.is_playlist,
             "ignoreerrors": False,
             "socket_timeout": 20,
+            # Внутренние ретраи yt-dlp на транзиентные сетевые сбои (TCP reset, SSL EOF,
+            # временная недоступность фрагмента) — гасят короткие обрывы за секунды, ещё
+            # до того, как ошибка вообще дойдёт до нашего кода. Более длительный обрыв
+            # (интернет пропал на десятки секунд/минуты) всё равно всплывёт наружу —
+            # тогда в дело вступает _wait_for_reconnect в _process_item.
+            "retries": 10,
+            "fragment_retries": 10,
+            "extractor_retries": 3,
+            "file_access_retries": 5,
+            # Явно, а не полагаясь на дефолт: не начинать файл заново, если рядом уже
+            # лежит недокачанный .part — именно это и делает "интернет пропал — докачать,
+            # а не с нуля" рабочим на уровне отдельного файла.
+            "continuedl": True,
+            "nopart": False,
             # По умолчанию yt-dlp пробует решать JS-челлендж YouTube только через deno.
             # Прописывать оба движка вслепую значило ждать таймаут на каждом запуске
             # отсутствующего — берём только те, что реально стоят в системе.

@@ -83,7 +83,7 @@ class MainWindow(QMainWindow):
         # --- строка ввода URL ---
         url_row = QHBoxLayout()
         self.url_input = QLineEdit()
-        self.url_input.setPlaceholderText("Вставьте ссылку на видео или плейлист YouTube...")
+        self.url_input.setPlaceholderText("Вставьте ссылку на видео или плейлист YouTube/Rutube...")
         self.url_input.textChanged.connect(self._on_url_changed)
         url_row.addWidget(self.url_input, stretch=1)
 
@@ -369,7 +369,7 @@ class MainWindow(QMainWindow):
         url = self.url_input.text().strip()
         link_type = detect_link_type(url)
         if link_type == LinkType.INVALID:
-            QMessageBox.warning(self, "Некорректная ссылка", "Введите корректную ссылку на видео YouTube.")
+            QMessageBox.warning(self, "Некорректная ссылка", "Введите корректную ссылку на видео YouTube или Rutube.")
             return
 
         info = self._pending_info or {}
